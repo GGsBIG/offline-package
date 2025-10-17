@@ -700,14 +700,12 @@ EOF
 
   sudo systemctl daemon-reload
   sudo systemctl enable --now containerd
-  sudo systemctl status containerd.service
 
   sudo mkdir -p /etc/containerd
   sudo containerd config default | sudo tee /etc/containerd/config.toml >/dev/null
   sudo sed -i "s/SystemdCgroup = false/SystemdCgroup = true/" /etc/containerd/config.toml
   sudo sed -i "s|sandbox_image = \"k8s.gcr.io/pause:3.8\"|sandbox_image = \"registry.k8s.io/pause:3.10\"|" /etc/containerd/config.toml
   sudo systemctl daemon-reload && sudo systemctl restart containerd.service
-  sudo systemctl status containerd.service
 }
 
 install_runc() {
