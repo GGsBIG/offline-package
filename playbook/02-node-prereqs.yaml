@@ -1,0 +1,58 @@
+---
+- name: Configure system prerequisites for Kubernetes nodes
+  hosts: all
+  become: true
+  vars:
+    overlay_modules:
+      - br_netfilter
+      - overlay
+    sysctl_settings:
+      net.bridge.bridge-nf-call-iptables: 1
+      net.bridge.bridge-nf-call-ip6tables: 1
+      net.ipv4.ip_forward: 1
+  tasks:
+    - name: Disable swap immediately
+      ansible.builtin.command: swapoff -a
+      when: ansible_swaptotal_mb | default(0) > 0
+      failed_when: false
+      changed_when: true
+
+    - name: Comment swap entries in /etc/fstab
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^([^#].*\s+swap\s+.*)$'
+        replace: '#\1'
+
+    - name: Ensure required kernel modules are loaded on boot
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/k8s.conf
+        mode: "0644"
+        content: |
+          br_netfilter
+          overlay
+
+    - name: Load kernel modules immediately
+      ansible.builtin.command: "modprobe {{ item }}"
+      loop: "{{ overlay_modules }}"
+
+    - name: Configure Kubernetes sysctl settings
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-kubernetes-cri.conf
+        mode: "0644"
+        content: |
+          net.bridge.bridge-nf-call-iptables  = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward                 = 1
+
+    - name: Apply sysctl settings
+      ansible.builtin.command: sysctl --system
+      changed_when: true
+
+    - name: Ensure cluster hostnames resolve locally
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: "{{ hostvars[item].ansible_host }}\\s+{{ hostvars[item].inventory_hostname }}"
+        line: "{{ hostvars[item].ansible_host }} {{ hostvars[item].inventory_hostname }}"
+        state: present
+      loop: "{{ (groups['masters'] | default([])) + (groups['workers'] | default([])) }}"
+      when: hostvars[item].ansible_host is defined

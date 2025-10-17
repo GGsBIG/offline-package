@@ -1,0 +1,33 @@
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: InitConfiguration
+localAPIEndpoint:
+  advertiseAddress: {{ control_plane_ip }}
+  bindPort: 6443
+nodeRegistration:
+  criSocket: unix:///run/containerd/containerd.sock
+  imagePullPolicy: IfNotPresent
+  name: {{ control_plane_hostname }}
+  taints: []
+---
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: ClusterConfiguration
+kubernetesVersion: {{ kubernetes_version }}
+clusterName: {{ cluster_name }}
+controlPlaneEndpoint: {{ control_plane_endpoint }}
+imageRepository: {{ image_repository }}
+networking:
+  podSubnet: {{ pod_subnet }}
+  serviceSubnet: {{ service_subnet }}
+  dnsDomain: {{ dns_domain }}
+controllerManager:
+  extraArgs:
+    bind-address: "0.0.0.0"
+    secure-port: "10257"
+scheduler:
+  extraArgs:
+    bind-address: "0.0.0.0"
+    secure-port: "10259"
+apiServer:
+  extraArgs:
+    authorization-mode: Node,RBAC
+    enable-admission-plugins: NodeRestriction

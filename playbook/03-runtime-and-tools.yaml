@@ -1,0 +1,136 @@
+---
+- name: Install container runtime and Kubernetes node tools
+  hosts: all
+  become: true
+  vars:
+    offline_dest_dir: /opt/offline-package
+    package_dir: "{{ offline_dest_dir }}/k8s-package"
+    containerd_archive: "{{ package_dir }}/containerd-2.1.3-linux-amd64.tar.gz"
+    runc_binary: "{{ package_dir }}/runc.amd64"
+    cni_archive: "{{ package_dir }}/cni-plugins.tgz"
+    crictl_archive: "{{ package_dir }}/crictl-v1.33.0-linux-amd64.tar.gz"
+    images_archive: "{{ package_dir }}/images.tar.zst"
+    images_tar: "{{ package_dir }}/k8s_images.tar"
+    images_marker: /etc/containerd/.k8s-images.loaded
+  tasks:
+    - name: Ensure containerd archive is present
+      ansible.builtin.stat:
+        path: "{{ containerd_archive }}"
+      register: containerd_stat
+
+    - name: Fail if containerd archive is missing
+      ansible.builtin.fail:
+        msg: "Containerd archive not found at {{ containerd_archive }}. Run 01-prepare-packages first."
+      when: not containerd_stat.stat.exists
+
+    - name: Install containerd binaries
+      ansible.builtin.unarchive:
+        src: "{{ containerd_archive }}"
+        dest: /usr/local
+        extra_opts:
+          - "--strip-components=0"
+        remote_src: true
+        creates: /usr/local/bin/containerd
+
+    - name: Install containerd systemd unit
+      ansible.builtin.template:
+        src: containerd.service.j2
+        dest: /usr/local/lib/systemd/system/containerd.service
+        mode: "0644"
+
+    - name: Ensure containerd configuration directory exists
+      ansible.builtin.file:
+        path: /etc/containerd
+        state: directory
+        mode: "0755"
+
+    - name: Generate default containerd configuration if missing
+      ansible.builtin.shell: |
+        /usr/local/bin/containerd config default > /etc/containerd/config.toml
+      args:
+        creates: /etc/containerd/config.toml
+        executable: /bin/bash
+
+    - name: Ensure containerd uses systemd cgroups
+      ansible.builtin.replace:
+        path: /etc/containerd/config.toml
+        regexp: '^\s*SystemdCgroup = false'
+        replace: '            SystemdCgroup = true'
+
+    - name: Ensure containerd pause image uses registry.k8s.io
+      ansible.builtin.replace:
+        path: /etc/containerd/config.toml
+        regexp: 'sandbox_image = "k8s.gcr.io/pause:3.8"'
+        replace: 'sandbox_image = "registry.k8s.io/pause:3.10"'
+
+    - name: Install runc binary
+      ansible.builtin.copy:
+        src: "{{ runc_binary }}"
+        dest: /usr/local/sbin/runc
+        mode: "0755"
+        remote_src: true
+
+    - name: Install CNI plugins
+      ansible.builtin.unarchive:
+        src: "{{ cni_archive }}"
+        dest: /opt/cni/bin
+        remote_src: true
+        creates: /opt/cni/bin/bridge
+
+    - name: Install crictl tool
+      ansible.builtin.unarchive:
+        src: "{{ crictl_archive }}"
+        dest: /usr/local/bin
+        remote_src: true
+        creates: /usr/local/bin/crictl
+
+    - name: Configure crictl defaults
+      ansible.builtin.template:
+        src: crictl.yaml.j2
+        dest: /etc/crictl.yaml
+        mode: "0644"
+
+    - name: Ensure Kubernetes image archive is present
+      ansible.builtin.stat:
+        path: "{{ images_archive }}"
+      register: images_stat
+
+    - name: Check if images already imported
+      ansible.builtin.stat:
+        path: "{{ images_marker }}"
+      register: images_marker_stat
+
+    - name: Decompress Kubernetes image bundle
+      ansible.builtin.shell: |
+        tar --zstd -xf "{{ images_archive }}" -C "{{ package_dir }}"
+      args:
+        executable: /bin/bash
+        creates: "{{ images_tar }}"
+      when: images_stat.stat.exists
+
+    - name: Import Kubernetes images into containerd
+      ansible.builtin.command: >-
+        ctr -n k8s.io images import {{ images_tar }}
+      when:
+        - images_stat.stat.exists
+        - not images_marker_stat.stat.exists
+      register: image_import
+
+    - name: Mark images as imported
+      ansible.builtin.file:
+        path: "{{ images_marker }}"
+        state: touch
+      when: image_import is defined and image_import.rc == 0
+
+    - name: Reload and enable containerd
+      ansible.builtin.systemd:
+        name: containerd
+        enabled: true
+        daemon_reload: true
+        state: restarted
+
+    - name: Verify containerd status
+      ansible.builtin.command: systemctl is-active containerd
+      register: containerd_active
+      changed_when: false
+      failed_when: containerd_active.stdout.strip() != 'active'

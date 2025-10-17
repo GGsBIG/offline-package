@@ -1,0 +1,18 @@
+[Unit]
+Description=containerd container runtime
+Documentation=https://containerd.io
+After=network.target local-fs.target
+
+[Service]
+ExecStart=/usr/local/bin/containerd
+Restart=always
+RestartSec=5
+LimitNOFILE=infinity
+LimitCORE=infinity
+TasksMax=infinity
+Delegate=yes
+KillMode=process
+OOMScoreAdjust=-999
+
+[Install]
+WantedBy=multi-user.target
