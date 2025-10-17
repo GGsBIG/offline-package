@@ -30,58 +30,6 @@ shell_quote() {
   printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\''/g")"
 }
 
-ensure_hosts_entries_loaded() {
-  if [[ ${#SSH_NODES[@]} -gt 0 ]]; then
-    return
-  fi
-
-  if [[ ! -f ${SSH_INVENTORY_FILE} ]]; then
-    return
-  fi
-
-  local in_masters=false
-  local in_workers=false
-  while IFS= read -r line; do
-    [[ -z ${line} || ${line} =~ ^[[:space:]]*# ]] && continue
-
-    if [[ ${line} =~ ^\[.*\]$ ]]; then
-      case ${line} in
-        "[masters]")
-          in_masters=true
-          in_workers=false
-          ;;
-        "[workers]")
-          in_masters=false
-          in_workers=true
-          ;;
-        *)
-          in_masters=false
-          in_workers=false
-          ;;
-      esac
-      continue
-    fi
-
-    if [[ ${line} =~ ^[a-zA-Z0-9_-]+ ]]; then
-      local hostname
-      local ip=""
-      hostname=$(echo "${line}" | awk '{print $1}')
-      if [[ ${line} =~ ansible_host=([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+) ]]; then
-        ip="${BASH_REMATCH[1]}"
-      fi
-
-      if [[ -n ${hostname} && -n ${ip} ]]; then
-        SSH_NODES+=("${ip}:${hostname}")
-        if [[ ${in_masters} == true ]]; then
-          SSH_MASTER_NODES+=("${ip}:${hostname}")
-        elif [[ ${in_workers} == true ]]; then
-          SSH_WORKER_NODES+=("${ip}:${hostname}")
-        fi
-      fi
-    fi
-  done < "${SSH_INVENTORY_FILE}"
-}
-
 ensure_sshpass_installed() {
   if command -v sshpass >/dev/null 2>&1; then
     return
@@ -227,6 +175,14 @@ load_ssh_config() {
   echo "  Nodes: ${#SSH_NODES[@]} found"
 }
 
+ensure_hosts_entries_loaded() {
+  if [[ ${#SSH_NODES[@]} -gt 0 && -n ${SSH_USERNAME} && -n ${SSH_USER_PASSWORD} && -n ${SSH_KEY_PATH} ]]; then
+    return
+  fi
+
+  load_ssh_config "${SSH_INVENTORY_FILE}"
+}
+
 generate_ssh_key_if_needed() {
   if [[ -z ${SSH_KEY_PATH} ]]; then
     return
@@ -243,6 +199,39 @@ generate_ssh_key_if_needed() {
   else
     echo "✓ SSH key exists"
   fi
+}
+
+copy_key_to_root() {
+  local node_ip="$1"
+  local ssh_target="${SSH_USERNAME}@${node_ip}"
+  local ssh_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5)
+
+  if [[ ! -f ${SSH_KEY_PATH}.pub ]]; then
+    echo "    ! Missing public key ${SSH_KEY_PATH}.pub"
+    return 1
+  fi
+
+  if [[ -z ${SSH_USER_PASSWORD} ]]; then
+    echo "    ! ansible_become_pass is required to copy key for root"
+    return 1
+  fi
+
+  if ! printf '%s\n' "${SSH_USER_PASSWORD}" | sshpass -p "${SSH_USER_PASSWORD}" ssh "${ssh_opts[@]}" "${ssh_target}" \
+    "sudo -S bash -c 'mkdir -p /root/.ssh && chmod 700 /root/.ssh'" 2>/dev/null; then
+    return 1
+  fi
+
+  if ! { printf '%s\n' "${SSH_USER_PASSWORD}"; cat "${SSH_KEY_PATH}.pub"; } | sshpass -p "${SSH_USER_PASSWORD}" ssh "${ssh_opts[@]}" "${ssh_target}" \
+    "sudo -S tee -a /root/.ssh/authorized_keys >/dev/null" 2>/dev/null; then
+    return 1
+  fi
+
+  if ! printf '%s\n' "${SSH_USER_PASSWORD}" | sshpass -p "${SSH_USER_PASSWORD}" ssh "${ssh_opts[@]}" "${ssh_target}" \
+    "sudo -S chmod 600 /root/.ssh/authorized_keys" 2>/dev/null; then
+    return 1
+  fi
+
+  return 0
 }
 
 setup_ssh_for_nodes() {
@@ -274,7 +263,7 @@ setup_ssh_for_nodes() {
     fi
 
     echo "  → Copying key to root@${node_ip}"
-    if sshpass -p "${SSH_ROOT_PASSWORD}" ssh-copy-id -o StrictHostKeyChecking=no -i "${SSH_KEY_PATH}.pub" "root@${node_ip}" 2>/dev/null; then
+    if copy_key_to_root "${node_ip}"; then
       echo "  ✓ Root key copied"
     else
       echo "  ✗ Root key failed"
@@ -351,8 +340,25 @@ setup_ssh() {
   setup_ssh_for_nodes
 }
 
+ensure_sudo_session() {
+  if [[ ${EUID} -eq 0 ]]; then
+    return
+  fi
+
+  if [[ -z ${SSH_USER_PASSWORD} ]]; then
+    sudo -v
+    return
+  fi
+
+  if ! printf '%s\n' "${SSH_USER_PASSWORD}" | sudo -S -v >/dev/null 2>&1; then
+    echo -e "${SSH_COLOR_RED}sudo authentication failed. Check ansible_become_pass in ${SSH_INVENTORY_FILE}.${SSH_COLOR_RESET}"
+    exit 1
+  fi
+}
+
 perform_installation() {
   ensure_hosts_entries_loaded
+  ensure_sudo_session
   prepare_packages
   basic_node_setup
   install_containerd
