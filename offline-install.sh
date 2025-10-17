@@ -48,6 +48,14 @@ shell_quote() {
   printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\''/g")"
 }
 
+run_async() {
+  local label="$1"
+  shift
+  (
+    "$@"
+  ) > >(sed "s/^/[${label}] /") 2> >(sed "s/^/[${label}] /" >&2)
+}
+
 ensure_sshpass_installed() {
   if command -v sshpass >/dev/null 2>&1; then
     return
@@ -252,76 +260,111 @@ copy_key_to_root() {
   return 0
 }
 
+setup_single_node() {
+  local node_ip="$1"
+  local hostname="$2"
+
+  echo "----------------------------------------"
+  if [[ -n ${hostname} ]]; then
+    echo "Setting up: ${node_ip} (hostname: ${hostname})"
+  else
+    echo "Setting up: ${node_ip}"
+  fi
+
+  if [[ -n ${hostname} ]]; then
+    echo "  → Setting hostname to: ${hostname}"
+    if sshpass -p "${SSH_USER_PASSWORD}" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "${SSH_USERNAME}@${node_ip}" "echo '${SSH_USER_PASSWORD}' | sudo -S bash -c 'hostnamectl set-hostname ${hostname} && sed -i \"/127.0.1.1/d\" /etc/hosts && echo \"127.0.1.1 ${hostname}\" >> /etc/hosts'" 2>/dev/null; then
+      echo "  ✓ Hostname set successfully"
+    else
+      echo "  ✗ Hostname setting failed"
+    fi
+  fi
+
+  echo "  → Copying key to ${SSH_USERNAME}@${node_ip}"
+  if ! sshpass -p "${SSH_USER_PASSWORD}" ssh-copy-id -o StrictHostKeyChecking=no -i "${SSH_KEY_PATH}.pub" "${SSH_USERNAME}@${node_ip}" 2>/dev/null; then
+    echo "  ✗ User key failed"
+    return 1
+  fi
+  echo "  ✓ User key copied"
+
+  echo "  → Copying key to root@${node_ip}"
+  if copy_key_to_root "${node_ip}"; then
+    echo "  ✓ Root key copied"
+  else
+    echo "  ✗ Root key failed"
+    return 1
+  fi
+
+  echo "  → Testing connections..."
+  if ssh -o ConnectTimeout=3 -o BatchMode=yes "${SSH_USERNAME}@${node_ip}" "echo 'User OK'" 2>/dev/null; then
+    echo "  ✓ User passwordless login works"
+  fi
+
+  if ssh -o ConnectTimeout=3 -o BatchMode=yes "root@${node_ip}" "echo 'Root OK'" 2>/dev/null; then
+    echo "  ✓ Root passwordless login works"
+  fi
+
+  if [[ -n ${hostname} ]]; then
+    local current_hostname
+    current_hostname=$(ssh -o ConnectTimeout=3 -o BatchMode=yes "${SSH_USERNAME}@${node_ip}" "hostname" 2>/dev/null || true)
+    if [[ ${current_hostname} == "${hostname}" ]]; then
+      echo "  ✓ Hostname verified: ${current_hostname}"
+    else
+      echo "  ! Hostname may need reboot to take effect"
+    fi
+  fi
+
+  return 0
+}
+
 setup_ssh_for_nodes() {
+  local -a pids=()
+  declare -A node_labels=()
+  local first_node_ip=""
+  local first_hostname=""
+
   for node_entry in "${SSH_NODES[@]}"; do
     IFS=':' read -r node_ip hostname <<< "${node_entry}"
+    [[ -z ${node_ip} ]] && continue
 
-    echo "----------------------------------------"
-    if [[ -n ${hostname} ]]; then
-      echo "Setting up: ${node_ip} (hostname: ${hostname})"
-    else
-      echo "Setting up: ${node_ip}"
+    if [[ -z ${first_node_ip} ]]; then
+      first_node_ip="${node_ip}"
+      first_hostname="${hostname}"
     fi
 
-    if [[ -n ${hostname} ]]; then
-      echo "  → Setting hostname to: ${hostname}"
-      if sshpass -p "${SSH_USER_PASSWORD}" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "${SSH_USERNAME}@${node_ip}" "echo '${SSH_USER_PASSWORD}' | sudo -S bash -c 'hostnamectl set-hostname ${hostname} && sed -i \"/127.0.1.1/d\" /etc/hosts && echo \"127.0.1.1 ${hostname}\" >> /etc/hosts'" 2>/dev/null; then
-        echo "  ✓ Hostname set successfully"
-      else
-        echo "  ✗ Hostname setting failed"
-      fi
-    fi
+    local label="${hostname:-${node_ip}}"
+    run_async "${label}" setup_single_node "${node_ip}" "${hostname}" &
+    local pid=$!
+    pids+=("${pid}")
+    node_labels["${pid}"]="${label}"
+  done
 
-    echo "  → Copying key to ${SSH_USERNAME}@${node_ip}"
-    if sshpass -p "${SSH_USER_PASSWORD}" ssh-copy-id -o StrictHostKeyChecking=no -i "${SSH_KEY_PATH}.pub" "${SSH_USERNAME}@${node_ip}" 2>/dev/null; then
-      echo "  ✓ User key copied"
-    else
-      echo "  ✗ User key failed"
-      continue
-    fi
-
-    echo "  → Copying key to root@${node_ip}"
-    if copy_key_to_root "${node_ip}"; then
-      echo "  ✓ Root key copied"
-    else
-      echo "  ✗ Root key failed"
-    fi
-
-    echo "  → Testing connections..."
-    if ssh -o ConnectTimeout=3 -o BatchMode=yes "${SSH_USERNAME}@${node_ip}" "echo 'User OK'" 2>/dev/null; then
-      echo "  ✓ User passwordless login works"
-    fi
-
-    if ssh -o ConnectTimeout=3 -o BatchMode=yes "root@${node_ip}" "echo 'Root OK'" 2>/dev/null; then
-      echo "  ✓ Root passwordless login works"
-    fi
-
-    if [[ -n ${hostname} ]]; then
-      local current_hostname
-      current_hostname=$(ssh -o ConnectTimeout=3 -o BatchMode=yes "${SSH_USERNAME}@${node_ip}" "hostname" 2>/dev/null || true)
-      if [[ ${current_hostname} == "${hostname}" ]]; then
-        echo "  ✓ Hostname verified: ${current_hostname}"
-      else
-        echo "  ! Hostname may need reboot to take effect"
-      fi
+  local failures=0
+  for pid in "${pids[@]}"; do
+    if ! wait "${pid}"; then
+      local label="${node_labels["${pid}"]:-${pid}}"
+      echo -e "${SSH_COLOR_RED}[${label}] SSH setup failed${SSH_COLOR_RESET}"
+      failures=$((failures + 1))
     fi
   done
+
+  if (( failures > 0 )); then
+    exit 1
+  fi
 
   echo "----------------------------------------"
   echo -e "${SSH_COLOR_GREEN}Setup completed!${SSH_COLOR_RESET}"
   echo ""
   echo "Test your passwordless login:"
-  for node_entry in "${SSH_NODES[@]}"; do
-    IFS=':' read -r node_ip hostname <<< "${node_entry}"
-    if [[ -n ${hostname} ]]; then
-      echo "  ssh ${SSH_USERNAME}@${node_ip}  # ${hostname}"
-      echo "  ssh root@${node_ip}       # ${hostname}"
+  if [[ -n ${first_node_ip} ]]; then
+    if [[ -n ${first_hostname} ]]; then
+      echo "  ssh ${SSH_USERNAME}@${first_node_ip}  # ${first_hostname}"
+      echo "  ssh root@${first_node_ip}       # ${first_hostname}"
     else
-      echo "  ssh ${SSH_USERNAME}@${node_ip}"
-      echo "  ssh root@${node_ip}"
+      echo "  ssh ${SSH_USERNAME}@${first_node_ip}"
+      echo "  ssh root@${first_node_ip}"
     fi
-    break
-  done
+  fi
 
   cat <<'EOF'
 #                       _oo0oo_
@@ -458,37 +501,59 @@ deploy_worker_nodes() {
     return
   fi
 
-  echo "開始部署 worker 節點"
-  local failures=0
+  echo "開始部署 worker 節點 (並行 ${#SSH_WORKER_NODES[@]} 台)"
+  local -a pids=()
+  declare -A worker_labels=()
+
   local worker_entry
   for worker_entry in "${SSH_WORKER_NODES[@]}"; do
     IFS=':' read -r node_ip hostname <<< "${worker_entry}"
-    if [[ -z ${node_ip} ]]; then
-      continue
-    fi
+    [[ -z ${node_ip} ]] && continue
 
-    echo "----------------------------------------"
-    echo "處理 ${hostname:-${node_ip}} (${node_ip})"
-
-    if ! sync_offline_package_to_worker "${node_ip}"; then
-      echo -e "${SSH_COLOR_RED}跳過 ${hostname:-${node_ip}}，請手動檢查${SSH_COLOR_RESET}"
-      failures=$((failures + 1))
-      continue
-    fi
-
-    if ! run_worker_installation "${node_ip}" "${hostname}" "${join_command}"; then
-      echo -e "${SSH_COLOR_RED}worker ${hostname:-${node_ip}} 安裝失敗${SSH_COLOR_RESET}"
-      failures=$((failures + 1))
-      continue
-    fi
-
-    echo "  ✓ worker ${hostname:-${node_ip}} 完成"
+    local label="${hostname:-${node_ip}}"
+    run_async "${label}" deploy_single_worker "${node_ip}" "${hostname}" "${join_command}" &
+    local pid=$!
+    pids+=("${pid}")
+    worker_labels["${pid}"]="${label}"
   done
 
-  if [[ ${failures} -gt 0 ]]; then
+  local failures=0
+  for pid in "${pids[@]}"; do
+    if ! wait "${pid}"; then
+      local label="${worker_labels["${pid}"]:-${pid}}"
+      echo -e "${SSH_COLOR_RED}[${label}] 佈署失敗${SSH_COLOR_RESET}"
+      failures=$((failures + 1))
+    fi
+  done
+
+  if (( failures > 0 )); then
     echo -e "${SSH_COLOR_RED}${failures} 個 worker 佈署失敗${SSH_COLOR_RESET}"
     exit 1
   fi
+
+  echo -e "${SSH_COLOR_GREEN}所有 worker 佈署完成${SSH_COLOR_RESET}"
+}
+
+deploy_single_worker() {
+  local node_ip="$1"
+  local hostname="$2"
+  local join_command="$3"
+
+  echo "----------------------------------------"
+  echo "處理 ${hostname:-${node_ip}} (${node_ip})"
+
+  if ! sync_offline_package_to_worker "${node_ip}"; then
+    echo -e "${SSH_COLOR_RED}跳過 ${hostname:-${node_ip}}，請手動檢查${SSH_COLOR_RESET}"
+    return 1
+  fi
+
+  if ! run_worker_installation "${node_ip}" "${hostname}" "${join_command}"; then
+    echo -e "${SSH_COLOR_RED}worker ${hostname:-${node_ip}} 安裝失敗${SSH_COLOR_RESET}"
+    return 1
+  fi
+
+  echo "  ✓ worker ${hostname:-${node_ip}} 完成"
+  return 0
 }
 
 auto_deploy_cluster() {
