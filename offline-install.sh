@@ -2,8 +2,8 @@
 set -euo pipefail
 
 ROLE=""
-CONTROL_PLANE_IP="10.8.57.223"
-CONTROL_PLANE_HOSTNAME="k8s-starlux-m1"
+CONTROL_PLANE_IP=""
+CONTROL_PLANE_HOSTNAME=""
 JOIN_COMMAND=""
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -21,10 +21,6 @@ SSH_NODES=()
 SSH_MASTER_NODES=()
 SSH_WORKER_NODES=()
 REMOTE_PACKAGE_DIR="offline-package"
-
-DEFAULT_SSH_USER=$(whoami)
-DEFAULT_SSH_PASSWORD="1qaz@WSX"
-DEFAULT_SSH_KEY="${HOME}/.ssh/id_rsa_offline"
 
 SSH_COLOR_GREEN='\033[0;32m'
 SSH_COLOR_RED='\033[0;31m'
@@ -134,21 +130,8 @@ load_ssh_config() {
   SSH_KEY_PATH=""
 
   if [[ ! -f ${inventory_file} ]]; then
-    cat <<'EOF' > "${inventory_file}"
-# Inventory for SSH setup - update the values to match your environment.
-
-[masters]
-k8s-starlux-m1 ansible_host=10.10.7.70
-
-[workers]
-k8s-starlux-w1 ansible_host=10.10.7.71
-k8s-starlux-w2 ansible_host=10.10.7.72
-
-[all:vars]
-ansible_user=bbg
-ansible_become_pass=1qaz@WSX
-ansible_ssh_private_key_file=~/.ssh/id_rsa_offline
-EOF
+    echo -e "${SSH_COLOR_RED}Error: Inventory file '${inventory_file}' not found!${SSH_COLOR_RESET}"
+    exit 1
   fi
 
   echo -e "${SSH_COLOR_GREEN}=== Ultra Simple SSH Setup ===${SSH_COLOR_RESET}"
@@ -220,29 +203,22 @@ EOF
     fi
   done < "${inventory_file}"
 
-  if [[ -z ${SSH_USERNAME} ]]; then
-    SSH_USERNAME="${DEFAULT_SSH_USER:-bbg}"
-    echo "未找到 ansible_user，使用預設帳號 ${SSH_USERNAME}"
-  fi
-
-  if [[ -z ${SSH_USER_PASSWORD} ]]; then
-    SSH_USER_PASSWORD="${DEFAULT_SSH_PASSWORD:-1qaz@WSX}"
-    echo "未找到 ansible_become_pass，使用預設密碼"
-  fi
-
-  if [[ -z ${SSH_KEY_PATH} ]]; then
-    SSH_KEY_PATH="${DEFAULT_SSH_KEY:-~/.ssh/id_rsa_offline}"
-    echo "未找到 ansible_ssh_private_key_file，使用預設私鑰 ${SSH_KEY_PATH}"
+  if [[ -z ${SSH_USERNAME} || -z ${SSH_USER_PASSWORD} || -z ${SSH_KEY_PATH} ]]; then
+    echo -e "${SSH_COLOR_RED}Error: Missing required configuration!${SSH_COLOR_RESET}"
+    echo "Required keys (in ${inventory_file} under [all:vars]):"
+    echo "  ansible_user"
+    echo "  ansible_become_pass"
+    echo "  ansible_ssh_private_key_file"
+    exit 1
   fi
 
   SSH_KEY_PATH="${SSH_KEY_PATH/#\~/${HOME}}"
   SSH_ROOT_PASSWORD="${SSH_USER_PASSWORD}"
 
   if [[ ${#SSH_NODES[@]} -eq 0 ]]; then
-    SSH_NODES=("10.10.7.70:k8s-starlux-m1" "10.10.7.71:k8s-starlux-w1" "10.10.7.72:k8s-starlux-w2")
-    SSH_MASTER_NODES=("10.10.7.70:k8s-starlux-m1")
-    SSH_WORKER_NODES=("10.10.7.71:k8s-starlux-w1" "10.10.7.72:k8s-starlux-w2")
-    echo "未在 inventory 找到節點，使用預設清單"
+    echo -e "${SSH_COLOR_RED}Error: No nodes found in inventory!${SSH_COLOR_RESET}"
+    echo "Please define [masters] and [workers] with ansible_host IP values in ${inventory_file}"
+    exit 1
   fi
 
   echo "✓ Configuration loaded"
