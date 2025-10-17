@@ -25,6 +25,24 @@ REMOTE_PACKAGE_DIR="offline-package"
 SSH_COLOR_GREEN='\033[0;32m'
 SSH_COLOR_RED='\033[0;31m'
 SSH_COLOR_RESET='\033[0m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+show_banner() {
+    echo -e "${BLUE}"
+    echo "██╗  ██╗ █████╗ ███████╗    ██████╗ ███████╗██████╗ ██╗      ██████╗ ██╗   ██╗"
+    echo "██║ ██╔╝██╔══██╗██╔════╝    ██╔══██╗██╔════╝██╔══██╗██║     ██╔═══██╗╚██╗ ██╔╝"
+    echo "█████╔╝ ╚█████╔╝███████╗    ██║  ██║█████╗  ██████╔╝██║     ██║   ██║ ╚████╔╝ "
+    echo "██╔═██╗ ██╔══██╗╚════██║    ██║  ██║██╔══╝  ██╔═══╝ ██║     ██║   ██║  ╚██╔╝  "
+    echo "██║  ██╗╚█████╔╝███████║    ██████╔╝███████╗██║     ███████╗╚██████╔╝   ██║   "
+    echo "╚═╝  ╚═╝ ╚════╝ ╚══════╝    ╚═════╝ ╚══════╝╚═╝     ╚══════╝ ╚═════╝    ╚═╝   "
+    echo ""
+    echo "           Kubernetes 1.34.1 Cluster Deployment (1 Master + 2 Workers)"
+    echo "                              Powered by Ansible"
+    echo -e "${NC}"
+}
+
+show_banner
 
 shell_quote() {
   printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\''/g")"
