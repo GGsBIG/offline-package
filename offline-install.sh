@@ -1,0 +1,626 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROLE=""
+CONTROL_PLANE_IP="10.8.57.223"
+CONTROL_PLANE_HOSTNAME="k8s-starlux-m1"
+JOIN_COMMAND=""
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+PACKAGE_DIR="${SCRIPT_DIR}/k8s-package"
+
+RUN_SSH_SETUP=false
+SSH_SETUP_ONLY=false
+SSH_INVENTORY_FILE="${SCRIPT_DIR}/inventory.ini"
+SSH_USERNAME=""
+SSH_USER_PASSWORD=""
+SSH_ROOT_PASSWORD=""
+SSH_KEY_PATH=""
+SSH_NODES=()
+
+SSH_COLOR_GREEN='\033[0;32m'
+SSH_COLOR_RED='\033[0;31m'
+SSH_COLOR_RESET='\033[0m'
+
+ensure_sshpass_installed() {
+  if command -v sshpass >/dev/null 2>&1; then
+    return
+  fi
+
+  echo -e "${SSH_COLOR_RED}Error: sshpass not installed${SSH_COLOR_RESET}"
+  echo "Installing sshpass automatically..."
+
+  if command -v apt >/dev/null 2>&1; then
+    sudo apt update && sudo apt install -y sshpass
+  elif command -v yum >/dev/null 2>&1; then
+    sudo yum install -y sshpass
+  elif command -v dnf >/dev/null 2>&1; then
+    sudo dnf install -y sshpass
+  elif command -v brew >/dev/null 2>&1; then
+    brew install sshpass
+  else
+    echo "Please install sshpass manually:"
+    echo "  Ubuntu/Debian: sudo apt install sshpass"
+    echo "  CentOS/RHEL: sudo yum install sshpass"
+    echo "  Fedora: sudo dnf install sshpass"
+    echo "  macOS: brew install sshpass"
+    exit 1
+  fi
+
+  if ! command -v sshpass >/dev/null 2>&1; then
+    echo -e "${SSH_COLOR_RED}Failed to install sshpass. Please install manually.${SSH_COLOR_RESET}"
+    exit 1
+  fi
+
+  echo -e "${SSH_COLOR_GREEN}✓ sshpass installed successfully${SSH_COLOR_RESET}"
+}
+
+load_ssh_config() {
+  local inventory_file="$1"
+  local in_masters_section=false
+  local in_workers_section=false
+  local in_all_vars_section=false
+
+  SSH_NODES=()
+  SSH_USERNAME=""
+  SSH_USER_PASSWORD=""
+  SSH_ROOT_PASSWORD=""
+  SSH_KEY_PATH=""
+
+  if [[ ! -f ${inventory_file} ]]; then
+    echo -e "${SSH_COLOR_RED}Error: Inventory file '${inventory_file}' not found!${SSH_COLOR_RESET}"
+    echo "Please create inventory.ini with configuration"
+    exit 1
+  fi
+
+  echo -e "${SSH_COLOR_GREEN}=== Ultra Simple SSH Setup ===${SSH_COLOR_RESET}"
+  echo "Loading configuration from: ${inventory_file}"
+
+  while IFS= read -r line; do
+    [[ -z ${line} || ${line} =~ ^[[:space:]]*# ]] && continue
+
+    if [[ ${line} =~ ^\[.*\]$ ]]; then
+      if [[ ${line} == "[masters]" ]]; then
+        in_masters_section=true
+        in_workers_section=false
+        in_all_vars_section=false
+      elif [[ ${line} == "[workers]" ]]; then
+        in_masters_section=false
+        in_workers_section=true
+        in_all_vars_section=false
+      elif [[ ${line} == "[all:vars]" ]]; then
+        in_masters_section=false
+        in_workers_section=false
+        in_all_vars_section=true
+      else
+        in_masters_section=false
+        in_workers_section=false
+        in_all_vars_section=false
+      fi
+      continue
+    fi
+
+    if [[ ${in_all_vars_section} == true && ${line} =~ ^[a-zA-Z_][a-zA-Z0-9_]*= ]]; then
+      local key
+      local value
+      key=$(echo "${line}" | cut -d'=' -f1)
+      value=$(echo "${line}" | cut -d'=' -f2- | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
+
+      case ${key} in
+        ansible_user)
+          SSH_USERNAME="${value}"
+          ;;
+        ansible_become_pass)
+          SSH_USER_PASSWORD="${value}"
+          ;;
+        ansible_ssh_private_key_file)
+          SSH_KEY_PATH="${value/#\~/${HOME}}"
+          ;;
+      esac
+    fi
+
+    if [[ ${in_masters_section} == true && ${line} =~ ^[a-zA-Z0-9-]+ ]]; then
+      local hostname
+      hostname=$(echo "${line}" | awk '{print $1}')
+      if [[ ${line} =~ ansible_host=([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+) ]]; then
+        local ip
+        ip="${BASH_REMATCH[1]}"
+        SSH_NODES+=("${ip}:${hostname}")
+      fi
+    fi
+
+    if [[ ${in_workers_section} == true && ${line} =~ ^[a-zA-Z0-9-]+ ]]; then
+      local hostname
+      hostname=$(echo "${line}" | awk '{print $1}')
+      if [[ ${line} =~ ansible_host=([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+) ]]; then
+        local ip
+        ip="${BASH_REMATCH[1]}"
+        SSH_NODES+=("${ip}:${hostname}")
+      fi
+    fi
+  done < "${inventory_file}"
+
+  SSH_ROOT_PASSWORD="${SSH_USER_PASSWORD}"
+
+  if [[ -z ${SSH_USERNAME} || -z ${SSH_USER_PASSWORD} || -z ${SSH_KEY_PATH} ]]; then
+    echo -e "${SSH_COLOR_RED}Error: Missing required configuration!${SSH_COLOR_RESET}"
+    echo "Required: ansible_user, ansible_become_pass, ansible_ssh_private_key_file"
+    echo "Make sure these are set in [all:vars] section"
+    exit 1
+  fi
+
+  if [[ ${#SSH_NODES[@]} -eq 0 ]]; then
+    echo -e "${SSH_COLOR_RED}Error: No nodes found in inventory!${SSH_COLOR_RESET}"
+    echo "Make sure you have [masters] and [workers] sections with ansible_host specified"
+    exit 1
+  fi
+
+  echo "✓ Configuration loaded"
+  echo "  Username: ${SSH_USERNAME}"
+  echo "  SSH Key: ${SSH_KEY_PATH}"
+  echo "  Nodes: ${#SSH_NODES[@]} found"
+}
+
+generate_ssh_key_if_needed() {
+  if [[ -z ${SSH_KEY_PATH} ]]; then
+    return
+  fi
+
+  local key_dir
+  key_dir=$(dirname "${SSH_KEY_PATH}")
+  mkdir -p "${key_dir}"
+
+  if [[ ! -f ${SSH_KEY_PATH} ]]; then
+    echo "Generating SSH key..."
+    ssh-keygen -t rsa -b 4096 -f "${SSH_KEY_PATH}" -N "" -C "admin@$(hostname)"
+    echo "✓ SSH key generated"
+  else
+    echo "✓ SSH key exists"
+  fi
+}
+
+setup_ssh_for_nodes() {
+  for node_entry in "${SSH_NODES[@]}"; do
+    IFS=':' read -r node_ip hostname <<< "${node_entry}"
+
+    echo "----------------------------------------"
+    if [[ -n ${hostname} ]]; then
+      echo "Setting up: ${node_ip} (hostname: ${hostname})"
+    else
+      echo "Setting up: ${node_ip}"
+    fi
+
+    if [[ -n ${hostname} ]]; then
+      echo "  → Setting hostname to: ${hostname}"
+      if sshpass -p "${SSH_USER_PASSWORD}" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "${SSH_USERNAME}@${node_ip}" "echo '${SSH_USER_PASSWORD}' | sudo -S bash -c 'hostnamectl set-hostname ${hostname} && sed -i \"/127.0.1.1/d\" /etc/hosts && echo \"127.0.1.1 ${hostname}\" >> /etc/hosts'" 2>/dev/null; then
+        echo "  ✓ Hostname set successfully"
+      else
+        echo "  ✗ Hostname setting failed"
+      fi
+    fi
+
+    echo "  → Copying key to ${SSH_USERNAME}@${node_ip}"
+    if sshpass -p "${SSH_USER_PASSWORD}" ssh-copy-id -o StrictHostKeyChecking=no -i "${SSH_KEY_PATH}.pub" "${SSH_USERNAME}@${node_ip}" 2>/dev/null; then
+      echo "  ✓ User key copied"
+    else
+      echo "  ✗ User key failed"
+      continue
+    fi
+
+    echo "  → Copying key to root@${node_ip}"
+    if sshpass -p "${SSH_ROOT_PASSWORD}" ssh-copy-id -o StrictHostKeyChecking=no -i "${SSH_KEY_PATH}.pub" "root@${node_ip}" 2>/dev/null; then
+      echo "  ✓ Root key copied"
+    else
+      echo "  ✗ Root key failed"
+    fi
+
+    echo "  → Testing connections..."
+    if ssh -o ConnectTimeout=3 -o BatchMode=yes "${SSH_USERNAME}@${node_ip}" "echo 'User OK'" 2>/dev/null; then
+      echo "  ✓ User passwordless login works"
+    fi
+
+    if ssh -o ConnectTimeout=3 -o BatchMode=yes "root@${node_ip}" "echo 'Root OK'" 2>/dev/null; then
+      echo "  ✓ Root passwordless login works"
+    fi
+
+    if [[ -n ${hostname} ]]; then
+      local current_hostname
+      current_hostname=$(ssh -o ConnectTimeout=3 -o BatchMode=yes "${SSH_USERNAME}@${node_ip}" "hostname" 2>/dev/null || true)
+      if [[ ${current_hostname} == "${hostname}" ]]; then
+        echo "  ✓ Hostname verified: ${current_hostname}"
+      else
+        echo "  ! Hostname may need reboot to take effect"
+      fi
+    fi
+  done
+
+  echo "----------------------------------------"
+  echo -e "${SSH_COLOR_GREEN}Setup completed!${SSH_COLOR_RESET}"
+  echo ""
+  echo "Test your passwordless login:"
+  for node_entry in "${SSH_NODES[@]}"; do
+    IFS=':' read -r node_ip hostname <<< "${node_entry}"
+    if [[ -n ${hostname} ]]; then
+      echo "  ssh ${SSH_USERNAME}@${node_ip}  # ${hostname}"
+      echo "  ssh root@${node_ip}       # ${hostname}"
+    else
+      echo "  ssh ${SSH_USERNAME}@${node_ip}"
+      echo "  ssh root@${node_ip}"
+    fi
+    break
+  done
+
+  cat <<'EOF'
+#                       _oo0oo_
+#                      o8888888o
+#                      88" . "88
+#                      (| -_- |)
+#                      0\  =  /0
+#                    ___/`---'\___
+#                  .' \|     |// '.
+#                 / \|||  :  |||// \
+#                / _||||| -:- |||||- \
+#               |   | \\  -  /// |   |
+#               | \_|  ''\---/''  |_/ |
+#               \  .-\__  '-'  ___/-. /
+#             ___'. .'  /--.--\  `. .'___
+#          ."" '<  `.___\_<|>_/___.' >' "".
+#         | | :  `- \`.;`\ _ /`.;/ - ` : | |
+#         \  \ `_.   \_ __\ /__ _/   .-` /  /
+#     =====`-.____`.___ \_____/___.-`___.-'=====
+#                       `=---='
+#
+#
+#     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#
+#               佛祖保佑         永無 BUG
+#               佛祖保佑         永不加班
+EOF
+}
+
+setup_ssh() {
+  ensure_sshpass_installed
+  load_ssh_config "${SSH_INVENTORY_FILE}"
+  generate_ssh_key_if_needed
+  setup_ssh_for_nodes
+}
+
+usage() {
+  cat <<USAGE
+Usage: $(basename "$0") [--setup-ssh] [--setup-ssh-only] --role control-plane|worker [--control-plane-ip <ip>] [--control-plane-hostname <name>] [--join-command "<command>"]
+
+Options:
+  --setup-ssh          Run SSH setup using inventory.ini before continuing installation
+  --setup-ssh-only     Run SSH setup using inventory.ini and exit without installing
+USAGE
+  exit 1
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --setup-ssh)
+        RUN_SSH_SETUP=true
+        shift
+        ;;
+      --setup-ssh-only)
+        RUN_SSH_SETUP=true
+        SSH_SETUP_ONLY=true
+        shift
+        ;;
+      --role)
+        ROLE=${2:-}
+        shift 2
+        ;;
+      --control-plane-ip)
+        CONTROL_PLANE_IP=${2:-}
+        shift 2
+        ;;
+      --control-plane-hostname)
+        CONTROL_PLANE_HOSTNAME=${2:-}
+        shift 2
+        ;;
+      --join-command)
+        JOIN_COMMAND=${2:-}
+        shift 2
+        ;;
+      *)
+        usage
+        ;;
+    esac
+  done
+
+  if [[ ${RUN_SSH_SETUP} == true && ${SSH_SETUP_ONLY} == false && -z ${ROLE} ]]; then
+    SSH_SETUP_ONLY=true
+    return
+  fi
+
+  if [[ ${SSH_SETUP_ONLY} == true ]]; then
+    return
+  fi
+
+  if [[ -z ${ROLE} ]]; then
+    usage
+  fi
+
+  if [[ ${ROLE} != "control-plane" && ${ROLE} != "worker" ]]; then
+    echo "--role must be control-plane or worker" >&2
+    exit 1
+  fi
+
+  if [[ ${ROLE} == "control-plane" && -z ${CONTROL_PLANE_IP} ]]; then
+    echo "--control-plane-ip is required for control-plane role" >&2
+    exit 1
+  fi
+
+  if [[ ${ROLE} == "worker" && -z ${JOIN_COMMAND} ]]; then
+    echo "--join-command is required for worker role" >&2
+    exit 1
+  fi
+}
+
+prepare_packages() {
+  local archives=("k8s-1.tar.zst" "k8s-2.tar.zst")
+  mkdir -p "${PACKAGE_DIR}"
+
+  for archive in "${archives[@]}"; do
+    local archive_path="${SCRIPT_DIR}/${archive}"
+    if [[ ! -f ${archive_path} ]]; then
+      echo "Missing archive ${archive_path}" >&2
+      exit 1
+    fi
+    tar --zstd -xf "${archive_path}" -C "${SCRIPT_DIR}"
+  done
+
+  local src_dirs=("${SCRIPT_DIR}/k8s" "${SCRIPT_DIR}/k8s-2")
+  shopt -s dotglob nullglob
+  for src in "${src_dirs[@]}"; do
+    if [[ -d ${src} ]]; then
+      for item in "${src}"/*; do
+        mv -f "${item}" "${PACKAGE_DIR}/"
+      done
+      rmdir "${src}"
+    fi
+  done
+  shopt -u dotglob nullglob
+}
+
+basic_node_setup() {
+  sudo swapoff -a
+  sudo sed -ri 's/(.+ swap .+)/#\1/' /etc/fstab
+
+  cat <<'EOF' | sudo tee /etc/modules-load.d/k8s.conf
+br_netfilter
+overlay
+EOF
+
+  sudo modprobe br_netfilter
+  sudo modprobe overlay
+
+  cat <<'EOF' | sudo tee /etc/sysctl.d/99-kubernetes-cri.conf
+net.bridge.bridge-nf-call-iptables  = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward                 = 1
+EOF
+
+  sudo sysctl --system
+
+  cat <<'EOF' | sudo tee -a /etc/hosts
+10.8.57.223 k8s-starlux-m1
+10.8.57.224 k8s-starlux-w1
+10.8.57.28 k8s-starlux-w2
+EOF
+}
+
+install_containerd() {
+  local archive="${PACKAGE_DIR}/containerd-2.1.3-linux-amd64.tar.gz"
+  sudo tar -C /usr/local -xzvf "${archive}"
+  sudo mkdir -p /usr/local/lib/systemd/system
+
+  cat <<'EOF' | sudo tee /usr/local/lib/systemd/system/containerd.service >/dev/null
+[Unit]
+Description=containerd container runtime
+Documentation=https://containerd.io
+After=network.target local-fs.target
+
+[Service]
+ExecStart=/usr/local/bin/containerd
+Restart=always
+RestartSec=5
+LimitNOFILE=infinity
+LimitCORE=infinity
+TasksMax=infinity
+Delegate=yes
+KillMode=process
+OOMScoreAdjust=-999
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now containerd
+  sudo systemctl status containerd.service
+
+  sudo mkdir -p /etc/containerd
+  sudo containerd config default | sudo tee /etc/containerd/config.toml >/dev/null
+  sudo sed -i "s/SystemdCgroup = false/SystemdCgroup = true/" /etc/containerd/config.toml
+  sudo sed -i "s|sandbox_image = \"k8s.gcr.io/pause:3.8\"|sandbox_image = \"registry.k8s.io/pause:3.10\"|" /etc/containerd/config.toml
+  sudo systemctl daemon-reload && sudo systemctl restart containerd.service
+  sudo systemctl status containerd.service
+}
+
+install_runc() {
+  local binary="${PACKAGE_DIR}/runc.amd64"
+  sudo install -m 755 "${binary}" /usr/local/sbin/runc
+  runc --version
+}
+
+install_cni_plugins() {
+  local archive="${PACKAGE_DIR}/cni-plugins.tgz"
+  sudo mkdir -p /opt/cni/bin
+  sudo tar xf "${archive}" -C /opt/cni/bin
+  sudo ls -l /opt/cni/bin
+}
+
+install_crictl() {
+  local version="v1.33.0"
+  local archive="${PACKAGE_DIR}/crictl-${version}-linux-amd64.tar.gz"
+  sudo tar -xzf "${archive}" -C /usr/local/bin
+  crictl --version
+
+  cat <<'EOF' | sudo tee /etc/crictl.yaml
+runtime-endpoint: unix:///run/containerd/containerd.sock
+image-endpoint: unix:///run/containerd/containerd.sock
+timeout: 10
+EOF
+}
+
+import_images() {
+  local archive="${PACKAGE_DIR}/images.tar.zst"
+  tar --zstd -xf "${archive}" -C "${PACKAGE_DIR}"
+  sudo ctr -n k8s.io images import "${PACKAGE_DIR}/k8s_images.tar"
+  sudo ctr -n k8s.io images ls | grep -E "(v1.33.2|calico|metrics|pause|etcd)"
+}
+
+install_kubernetes_control_plane() {
+  local archive="${PACKAGE_DIR}/kubernetes-server-linux-amd64.tar.gz"
+  sudo tar -xzf "${archive}" -C "${PACKAGE_DIR}"
+  sudo cp "${PACKAGE_DIR}/kubernetes/server/bin/kubeadm" /usr/bin/
+  sudo cp "${PACKAGE_DIR}/kubernetes/server/bin/kubelet" /usr/bin/
+  sudo cp "${PACKAGE_DIR}/kubernetes/server/bin/kubectl" /usr/bin/
+  kubeadm version
+  kubectl version --client
+}
+
+install_kubernetes_worker() {
+  local archive="${PACKAGE_DIR}/kubernetes-node-linux-amd64.tar.gz"
+  sudo tar -xzf "${archive}" -C "${PACKAGE_DIR}"
+  sudo cp "${PACKAGE_DIR}/kubernetes/node/bin/kubeadm" /usr/bin/
+  sudo cp "${PACKAGE_DIR}/kubernetes/node/bin/kubelet" /usr/bin/
+  kubeadm version
+}
+
+configure_kubelet_service() {
+  cat <<'EOF' | sudo tee /etc/systemd/system/kubelet.service
+[Unit]
+Description=kubelet: The Kubernetes Node Agent
+Documentation=https://kubernetes.io/docs/
+After=containerd.service
+Requires=containerd.service
+
+[Service]
+ExecStart=/usr/bin/kubelet
+Restart=always
+StartLimitInterval=0
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  sudo mkdir -p /etc/systemd/system/kubelet.service.d
+
+  cat <<'EOF' | sudo tee /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+[Service]
+Environment="KUBELET_KUBECONFIG_ARGS=--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf"
+Environment="KUBELET_CONFIG_ARGS=--config=/var/lib/kubelet/config.yaml"
+EnvironmentFile=-/var/lib/kubelet/kubeadm-flags.env
+EnvironmentFile=-/etc/default/kubelet
+ExecStart=
+ExecStart=/usr/bin/kubelet $KUBELET_KUBECONFIG_ARGS $KUBELET_CONFIG_ARGS $KUBELET_KUBEADM_ARGS $KUBELET_EXTRA_ARGS
+EOF
+
+  sudo systemctl enable kubelet
+  sudo systemctl stop kubelet
+}
+
+init_control_plane() {
+  local config_file="${SCRIPT_DIR}/cluster-config.yaml"
+  cat <<EOF > "${config_file}"
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: InitConfiguration
+localAPIEndpoint:
+  advertiseAddress: ${CONTROL_PLANE_IP}
+  bindPort: 6443
+nodeRegistration:
+  criSocket: unix:///run/containerd/containerd.sock
+  imagePullPolicy: IfNotPresent
+  name: ${CONTROL_PLANE_HOSTNAME}
+  taints: []
+---
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: ClusterConfiguration
+kubernetesVersion: 1.33.2
+clusterName: offline-k8s
+controlPlaneEndpoint: ${CONTROL_PLANE_IP}:6443
+imageRepository: registry.k8s.io
+networking:
+  podSubnet: 10.244.0.0/16
+  serviceSubnet: 10.96.0.0/16
+  dnsDomain: cluster.local
+controllerManager:
+  extraArgs:
+    bind-address: "0.0.0.0"
+    secure-port: "10257"
+scheduler:
+  extraArgs:
+    bind-address: "0.0.0.0"
+    secure-port: "10259"
+apiServer:
+  extraArgs:
+    authorization-mode: Node,RBAC
+    enable-admission-plugins: NodeRestriction
+EOF
+
+  sudo kubeadm init --config "${config_file}" --upload-certs
+}
+
+configure_kubectl() {
+  mkdir -p "$HOME/.kube"
+  sudo cp /etc/kubernetes/admin.conf "$HOME/.kube/config"
+  sudo chown "$(id -u):$(id -g)" "$HOME/.kube/config"
+}
+
+deploy_addons() {
+  kubectl apply -f "${PACKAGE_DIR}/calico.yaml"
+  kubectl -n kube-system get pods -l k8s-app=calico-node
+  kubectl apply -f "${PACKAGE_DIR}/components.yaml"
+  kubectl -n kube-system get pods -l k8s-app=metrics-server
+}
+
+join_worker() {
+  eval "${JOIN_COMMAND}"
+}
+
+main() {
+  parse_args "$@"
+  if [[ ${RUN_SSH_SETUP} == true ]]; then
+    setup_ssh
+    if [[ ${SSH_SETUP_ONLY} == true ]]; then
+      return
+    fi
+  fi
+
+  prepare_packages
+  basic_node_setup
+  install_containerd
+  install_runc
+  install_cni_plugins
+  install_crictl
+  import_images
+
+  if [[ ${ROLE} == "control-plane" ]]; then
+    install_kubernetes_control_plane
+    configure_kubelet_service
+    init_control_plane
+    configure_kubectl
+    deploy_addons
+  else
+    install_kubernetes_worker
+    configure_kubelet_service
+    join_worker
+  fi
+}
+
+main "$@"
