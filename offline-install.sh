@@ -11,16 +11,76 @@ PACKAGE_DIR="${SCRIPT_DIR}/k8s-package"
 
 RUN_SSH_SETUP=false
 SSH_SETUP_ONLY=false
+AUTO_DEPLOY=false
 SSH_INVENTORY_FILE="${SCRIPT_DIR}/inventory.ini"
 SSH_USERNAME=""
 SSH_USER_PASSWORD=""
 SSH_ROOT_PASSWORD=""
 SSH_KEY_PATH=""
 SSH_NODES=()
+SSH_MASTER_NODES=()
+SSH_WORKER_NODES=()
+REMOTE_PACKAGE_DIR="offline-package"
 
 SSH_COLOR_GREEN='\033[0;32m'
 SSH_COLOR_RED='\033[0;31m'
 SSH_COLOR_RESET='\033[0m'
+
+shell_quote() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\''/g")"
+}
+
+ensure_hosts_entries_loaded() {
+  if [[ ${#SSH_NODES[@]} -gt 0 ]]; then
+    return
+  fi
+
+  if [[ ! -f ${SSH_INVENTORY_FILE} ]]; then
+    return
+  fi
+
+  local in_masters=false
+  local in_workers=false
+  while IFS= read -r line; do
+    [[ -z ${line} || ${line} =~ ^[[:space:]]*# ]] && continue
+
+    if [[ ${line} =~ ^\[.*\]$ ]]; then
+      case ${line} in
+        "[masters]")
+          in_masters=true
+          in_workers=false
+          ;;
+        "[workers]")
+          in_masters=false
+          in_workers=true
+          ;;
+        *)
+          in_masters=false
+          in_workers=false
+          ;;
+      esac
+      continue
+    fi
+
+    if [[ ${line} =~ ^[a-zA-Z0-9_-]+ ]]; then
+      local hostname
+      local ip=""
+      hostname=$(echo "${line}" | awk '{print $1}')
+      if [[ ${line} =~ ansible_host=([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+) ]]; then
+        ip="${BASH_REMATCH[1]}"
+      fi
+
+      if [[ -n ${hostname} && -n ${ip} ]]; then
+        SSH_NODES+=("${ip}:${hostname}")
+        if [[ ${in_masters} == true ]]; then
+          SSH_MASTER_NODES+=("${ip}:${hostname}")
+        elif [[ ${in_workers} == true ]]; then
+          SSH_WORKER_NODES+=("${ip}:${hostname}")
+        fi
+      fi
+    fi
+  done < "${SSH_INVENTORY_FILE}"
+}
 
 ensure_sshpass_installed() {
   if command -v sshpass >/dev/null 2>&1; then
@@ -62,6 +122,8 @@ load_ssh_config() {
   local in_all_vars_section=false
 
   SSH_NODES=()
+  SSH_MASTER_NODES=()
+  SSH_WORKER_NODES=()
   SSH_USERNAME=""
   SSH_USER_PASSWORD=""
   SSH_ROOT_PASSWORD=""
@@ -126,6 +188,7 @@ load_ssh_config() {
         local ip
         ip="${BASH_REMATCH[1]}"
         SSH_NODES+=("${ip}:${hostname}")
+        SSH_MASTER_NODES+=("${ip}:${hostname}")
       fi
     fi
 
@@ -136,6 +199,7 @@ load_ssh_config() {
         local ip
         ip="${BASH_REMATCH[1]}"
         SSH_NODES+=("${ip}:${hostname}")
+        SSH_WORKER_NODES+=("${ip}:${hostname}")
       fi
     fi
   done < "${inventory_file}"
@@ -285,18 +349,175 @@ setup_ssh() {
   setup_ssh_for_nodes
 }
 
+perform_installation() {
+  ensure_hosts_entries_loaded
+  prepare_packages
+  basic_node_setup
+  install_containerd
+  install_runc
+  install_cni_plugins
+  install_crictl
+  import_images
+
+  if [[ ${ROLE} == "control-plane" ]]; then
+    install_kubernetes_control_plane
+    configure_kubelet_service
+    init_control_plane
+    configure_kubectl
+    deploy_addons
+  else
+    install_kubernetes_worker
+    configure_kubelet_service
+    join_worker
+  fi
+}
+
+generate_join_command() {
+  sudo kubeadm token create --print-join-command --ttl 0
+}
+
+sync_offline_package_to_worker() {
+  local node_ip="$1"
+  local ssh_target="${SSH_USERNAME}@${node_ip}"
+  local ssh_opts=(-i "${SSH_KEY_PATH}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes)
+
+  echo "  → 同步離線套件到 ${node_ip}"
+  if ! ssh "${ssh_opts[@]}" "${ssh_target}" "rm -rf ${REMOTE_PACKAGE_DIR} && mkdir -p ${REMOTE_PACKAGE_DIR}"; then
+    echo -e "${SSH_COLOR_RED}  ✗ 無法建立遠端目錄${SSH_COLOR_RESET}"
+    return 1
+  fi
+
+  local files=("offline-install.sh" "k8s-1.tar.zst" "k8s-2.tar.zst" "inventory.ini")
+  local file
+  for file in "${files[@]}"; do
+    local file_path="${SCRIPT_DIR}/${file}"
+    if [[ ! -e ${file_path} ]]; then
+      echo -e "${SSH_COLOR_RED}  ✗ 缺少檔案 ${file_path}${SSH_COLOR_RESET}"
+      return 1
+    fi
+    if ! scp "${ssh_opts[@]}" "${file_path}" "${ssh_target}:${REMOTE_PACKAGE_DIR}/"; then
+      echo -e "${SSH_COLOR_RED}  ✗ 傳送 ${file} 失敗${SSH_COLOR_RESET}"
+      return 1
+    fi
+  done
+
+  ssh "${ssh_opts[@]}" "${ssh_target}" "chmod +x ${REMOTE_PACKAGE_DIR}/offline-install.sh" >/dev/null
+}
+
+run_worker_installation() {
+  local node_ip="$1"
+  local hostname="$2"
+  local join_command="$3"
+  local ssh_target="${SSH_USERNAME}@${node_ip}"
+  local ssh_opts=(-i "${SSH_KEY_PATH}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes)
+
+  local join_command_quoted
+  join_command_quoted=$(shell_quote "${join_command}")
+  local remote_cmd="cd ${REMOTE_PACKAGE_DIR} && ./offline-install.sh --role worker --join-command ${join_command_quoted}"
+  local remote_cmd_quoted
+  remote_cmd_quoted=$(shell_quote "${remote_cmd}")
+
+  echo "  → 安裝 worker 節點 ${hostname:-${node_ip}}"
+  if ! ssh "${ssh_opts[@]}" "${ssh_target}" "bash -lc ${remote_cmd_quoted}"; then
+    echo -e "${SSH_COLOR_RED}  ✗ 安裝失敗${SSH_COLOR_RESET}"
+    return 1
+  fi
+}
+
+deploy_worker_nodes() {
+  local join_command="$1"
+
+  if [[ ${#SSH_WORKER_NODES[@]} -eq 0 ]]; then
+    echo "沒有定義 worker 節點，跳過部署"
+    return
+  fi
+
+  echo "開始部署 worker 節點"
+  local failures=0
+  local worker_entry
+  for worker_entry in "${SSH_WORKER_NODES[@]}"; do
+    IFS=':' read -r node_ip hostname <<< "${worker_entry}"
+    if [[ -z ${node_ip} ]]; then
+      continue
+    fi
+
+    echo "----------------------------------------"
+    echo "處理 ${hostname:-${node_ip}} (${node_ip})"
+
+    if ! sync_offline_package_to_worker "${node_ip}"; then
+      echo -e "${SSH_COLOR_RED}跳過 ${hostname:-${node_ip}}，請手動檢查${SSH_COLOR_RESET}"
+      failures=$((failures + 1))
+      continue
+    fi
+
+    if ! run_worker_installation "${node_ip}" "${hostname}" "${join_command}"; then
+      echo -e "${SSH_COLOR_RED}worker ${hostname:-${node_ip}} 安裝失敗${SSH_COLOR_RESET}"
+      failures=$((failures + 1))
+      continue
+    fi
+
+    echo "  ✓ worker ${hostname:-${node_ip}} 完成"
+  done
+
+  if [[ ${failures} -gt 0 ]]; then
+    echo -e "${SSH_COLOR_RED}${failures} 個 worker 佈署失敗${SSH_COLOR_RESET}"
+    exit 1
+  fi
+}
+
+auto_deploy_cluster() {
+  ensure_hosts_entries_loaded
+
+  if [[ ${#SSH_MASTER_NODES[@]} -eq 0 ]]; then
+    echo -e "${SSH_COLOR_RED}inventory.ini 未定義 masters 區段，無法自動部署${SSH_COLOR_RESET}"
+    exit 1
+  fi
+
+  local master_entry="${SSH_MASTER_NODES[0]}"
+  IFS=':' read -r master_ip master_hostname <<< "${master_entry}"
+  if [[ -z ${master_ip} ]]; then
+    echo -e "${SSH_COLOR_RED}masters 設定缺少 ansible_host，無法自動部署${SSH_COLOR_RESET}"
+    exit 1
+  fi
+
+  if [[ -n ${master_hostname} ]]; then
+    CONTROL_PLANE_HOSTNAME="${master_hostname}"
+  fi
+  CONTROL_PLANE_IP="${master_ip}"
+  ROLE="control-plane"
+
+  echo "自動部署控制平面 ${CONTROL_PLANE_HOSTNAME:-master} (${CONTROL_PLANE_IP})"
+  perform_installation
+
+  local join_command
+  join_command=$(generate_join_command)
+  if [[ -z ${join_command} ]]; then
+    echo -e "${SSH_COLOR_RED}無法取得 join 指令${SSH_COLOR_RESET}"
+    exit 1
+  fi
+
+  echo "取得 join 指令: ${join_command}"
+  deploy_worker_nodes "${join_command}"
+}
+
 usage() {
   cat <<USAGE
-Usage: $(basename "$0") [--setup-ssh] [--setup-ssh-only] --role control-plane|worker [--control-plane-ip <ip>] [--control-plane-hostname <name>] [--join-command "<command>"]
-
-Options:
-  --setup-ssh          Run SSH setup using inventory.ini before continuing installation
-  --setup-ssh-only     Run SSH setup using inventory.ini and exit without installing
+Usage: $(basename "$0")
+       $(basename "$0") --setup-ssh
+       $(basename "$0") --setup-ssh-only
+       $(basename "$0") --role control-plane|worker [--control-plane-ip <ip>] [--control-plane-hostname <name>] [--join-command "<command>"]
 USAGE
   exit 1
 }
 
 parse_args() {
+  if [[ $# -eq 0 ]]; then
+    AUTO_DEPLOY=true
+    RUN_SSH_SETUP=true
+    SSH_SETUP_ONLY=false
+    return
+  fi
+
   while [[ $# -gt 0 ]]; do
     case $1 in
       --setup-ssh)
@@ -329,11 +550,6 @@ parse_args() {
         ;;
     esac
   done
-
-  if [[ ${RUN_SSH_SETUP} == true && ${SSH_SETUP_ONLY} == false && -z ${ROLE} ]]; then
-    SSH_SETUP_ONLY=true
-    return
-  fi
 
   if [[ ${SSH_SETUP_ONLY} == true ]]; then
     return
@@ -405,11 +621,29 @@ EOF
 
   sudo sysctl --system
 
-  cat <<'EOF' | sudo tee -a /etc/hosts
-10.8.57.223 k8s-starlux-m1
-10.8.57.224 k8s-starlux-w1
-10.8.57.28 k8s-starlux-w2
-EOF
+  ensure_hosts_entries_loaded
+  if [[ ${#SSH_NODES[@]} -gt 0 ]]; then
+    local hosts_buffer=""
+    local entry
+    for entry in "${SSH_NODES[@]}"; do
+      IFS=':' read -r node_ip hostname <<< "${entry}"
+      if [[ -z ${node_ip} || -z ${hostname} ]]; then
+        continue
+      fi
+      hosts_buffer+="${node_ip} ${hostname}\n"
+    done
+
+    if [[ -n ${hosts_buffer} ]]; then
+      while IFS= read -r host_line; do
+        [[ -z ${host_line} ]] && continue
+        local host_name
+        host_name=$(echo "${host_line}" | awk '{print $2}')
+        sudo sed -i "\\| ${host_name}$|d" /etc/hosts
+      done <<< "${hosts_buffer}"
+
+      printf '%b' "${hosts_buffer}" | sudo tee -a /etc/hosts >/dev/null
+    fi
+  fi
 }
 
 install_containerd() {
@@ -602,25 +836,16 @@ main() {
     fi
   fi
 
-  prepare_packages
-  basic_node_setup
-  install_containerd
-  install_runc
-  install_cni_plugins
-  install_crictl
-  import_images
-
-  if [[ ${ROLE} == "control-plane" ]]; then
-    install_kubernetes_control_plane
-    configure_kubelet_service
-    init_control_plane
-    configure_kubectl
-    deploy_addons
-  else
-    install_kubernetes_worker
-    configure_kubelet_service
-    join_worker
+  if [[ ${AUTO_DEPLOY} == true ]]; then
+    auto_deploy_cluster
+    return
   fi
+
+  if [[ -z ${ROLE} ]]; then
+    usage
+  fi
+
+  perform_installation
 }
 
 main "$@"
