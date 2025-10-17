@@ -22,6 +22,10 @@ SSH_MASTER_NODES=()
 SSH_WORKER_NODES=()
 REMOTE_PACKAGE_DIR="offline-package"
 
+DEFAULT_SSH_USER=$(whoami)
+DEFAULT_SSH_PASSWORD="1qaz@WSX"
+DEFAULT_SSH_KEY="${HOME}/.ssh/id_rsa_offline"
+
 SSH_COLOR_GREEN='\033[0;32m'
 SSH_COLOR_RED='\033[0;31m'
 SSH_COLOR_RESET='\033[0m'
@@ -130,9 +134,21 @@ load_ssh_config() {
   SSH_KEY_PATH=""
 
   if [[ ! -f ${inventory_file} ]]; then
-    echo -e "${SSH_COLOR_RED}Error: Inventory file '${inventory_file}' not found!${SSH_COLOR_RESET}"
-    echo "Please create inventory.ini with configuration"
-    exit 1
+    cat <<'EOF' > "${inventory_file}"
+# Inventory for SSH setup - update the values to match your environment.
+
+[masters]
+k8s-starlux-m1 ansible_host=10.10.7.70
+
+[workers]
+k8s-starlux-w1 ansible_host=10.10.7.71
+k8s-starlux-w2 ansible_host=10.10.7.72
+
+[all:vars]
+ansible_user=bbg
+ansible_become_pass=1qaz@WSX
+ansible_ssh_private_key_file=~/.ssh/id_rsa_offline
+EOF
   fi
 
   echo -e "${SSH_COLOR_GREEN}=== Ultra Simple SSH Setup ===${SSH_COLOR_RESET}"
@@ -204,19 +220,29 @@ load_ssh_config() {
     fi
   done < "${inventory_file}"
 
-  SSH_ROOT_PASSWORD="${SSH_USER_PASSWORD}"
-
-  if [[ -z ${SSH_USERNAME} || -z ${SSH_USER_PASSWORD} || -z ${SSH_KEY_PATH} ]]; then
-    echo -e "${SSH_COLOR_RED}Error: Missing required configuration!${SSH_COLOR_RESET}"
-    echo "Required: ansible_user, ansible_become_pass, ansible_ssh_private_key_file"
-    echo "Make sure these are set in [all:vars] section"
-    exit 1
+  if [[ -z ${SSH_USERNAME} ]]; then
+    SSH_USERNAME="${DEFAULT_SSH_USER:-bbg}"
+    echo "未找到 ansible_user，使用預設帳號 ${SSH_USERNAME}"
   fi
 
+  if [[ -z ${SSH_USER_PASSWORD} ]]; then
+    SSH_USER_PASSWORD="${DEFAULT_SSH_PASSWORD:-1qaz@WSX}"
+    echo "未找到 ansible_become_pass，使用預設密碼"
+  fi
+
+  if [[ -z ${SSH_KEY_PATH} ]]; then
+    SSH_KEY_PATH="${DEFAULT_SSH_KEY:-~/.ssh/id_rsa_offline}"
+    echo "未找到 ansible_ssh_private_key_file，使用預設私鑰 ${SSH_KEY_PATH}"
+  fi
+
+  SSH_KEY_PATH="${SSH_KEY_PATH/#\~/${HOME}}"
+  SSH_ROOT_PASSWORD="${SSH_USER_PASSWORD}"
+
   if [[ ${#SSH_NODES[@]} -eq 0 ]]; then
-    echo -e "${SSH_COLOR_RED}Error: No nodes found in inventory!${SSH_COLOR_RESET}"
-    echo "Make sure you have [masters] and [workers] sections with ansible_host specified"
-    exit 1
+    SSH_NODES=("10.10.7.70:k8s-starlux-m1" "10.10.7.71:k8s-starlux-w1" "10.10.7.72:k8s-starlux-w2")
+    SSH_MASTER_NODES=("10.10.7.70:k8s-starlux-m1")
+    SSH_WORKER_NODES=("10.10.7.71:k8s-starlux-w1" "10.10.7.72:k8s-starlux-w2")
+    echo "未在 inventory 找到節點，使用預設清單"
   fi
 
   echo "✓ Configuration loaded"
